@@ -1,0 +1,732 @@
+---
+title: "UCRB Modeling SoilDepth"
+author: "cbrungard"
+date: "August 24, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyr)
+library(caret)
+library(ranger)
+library(sp)
+library(doParallel)
+```
+
+1. Load observations and split into training and evaluation sets. 
+```{r, include=FALSE}
+# Read in regression matrix
+obs <- read.csv("Z:/UCRB/Observations/regMatrix_2.15.19.csv")
+
+#Force depth classes to be an ordered factor
+obs$DepthClass <- factor(obs$DepthClass, levels = c('BR', 'VS', 'S', 'MD', 'D', 'VD'))
+
+# Force factors to be factors
+obs$gmph_mosaic_m <- as.factor(obs$gmph_mosaic_m)
+
+# I originally included lat/long as predictors. I am glad that I did this because they came out as important predictors which revealed that the clustering of data did have an impact, but including lat/long as covariates produces spurious spatial patterns in the predictions (they are often among the most important predictors). When I remove them accuracy drops ~ 3%, but remove them. Does this suggest that I should use regression kriging for continious attributes?
+
+# Also remove GAP and NLCDcl factors because there are 93 levels of GAP (too many levels for RF) and NLCDcl classes 0 and 128 are never observed in the data. Also remove US_L4Name (EPA ecoregion IV), because it has too many levels
+
+# After some thought, I also decided to exclude the standard deviation of the Landsat band ratios: 5/7, 5/4, and 5/1. While these were somewhat (not very) important predictors I can't explain them. The median values are intended to capture spatial variations in minerology/geology, but are obviously influenced by vegetation. Since I am including variability in NDVI (4/3) I feel that this captures vegetation variability and this I can explain. Interestlingly, when I remove these std deviations variables the model accuray and kappa both increase by 2-3%.
+
+# The predictions had holes because of holes in the radar or imagery in areas of deep cliff or canyon. I've got enough observations that it is easiest to just drop these for now. My other option would be to fill the 'holes' in the the raster using inverse distance weighting (rfillspgaps in the meteo package), but I tried this and maxed out 32 GB memory (could probably do this with 64 GB Ram). I'm just going to remove these observations. After running the models without radar imagery I find that the accuracy drops ~ 0.5 to 1% (for both CV and independent validation). I think that this is justified as dropping the radar imagery means that I don't have big holes in the predictions. 
+
+# Also remove SiteID and depth (in cm) from the data
+obs2 <- subset(obs, select=-c(SiteID,Depth,GAP,NLCDcl_m,L51_std_m,L54_std_m,L57_std_m,vv_med_m,vv_std_m))
+
+# Remove missing depth class values
+obs3 <- drop_na(obs2)
+
+# Split into training and test using the KSSL data and a random subset of 5% each class as validation. 
+# Depth class
+# Training
+t.dc <- obs3[obs3$source != 'KSSL',]
+dc.index <- createDataPartition(t.dc$DepthClass, p = 0.95, list = FALSE)
+t.dc2 <- t.dc[dc.index, ]
+# Remove source, x, and y fields. This makes coding a bit easier, but leaves t.dc2 available for plotting 
+t.dc3 <- t.dc2[,-c(2:4)]
+
+#Validation (I may need to think about bedrock since KSSL data has no bedrock observations this effectively 'undersamples' bedrock in the validation data...)
+v.dc <- obs3[obs3$source == 'KSSL',]
+v.dc2 <- t.dc[-dc.index, ]
+v.dc3 <- rbind(v.dc, v.dc2)
+# Remove source, x, and y fields. This makes coding a bit easier, but leaves t.dc2 available for plotting 
+v.dc4 <- v.dc3[,-c(2:4)]
+```
+
+
+PART I --------------------------------
+3. Modeling
+Set up model tuning parameters that will be used repeatedly
+```{r}
+# Ranger options
+# Set up resampling options: 10 fold cross validation
+fitControl <- trainControl(method = "cv", 
+                           savePredictions = T, 
+                           returnResamp = 'final', 
+                           allowParallel = TRUE, 
+                           selectionFunction='oneSE', 
+                           summaryFunction = multiClassSummary)
+# Set a tune grid for manual control of tuning parameters
+rftunegrid <- expand.grid(mtry=c(2:10,15), 
+                          splitrule = "gini", 
+                          min.node.size = 10)
+
+# Recursive feature elimination (RFE) options
+# Define variable subset sizes when including land classifications (lc) covariates
+subsets_lc <- c(1:72)
+# Define variable subset sizes when NOT including land classifications (nlc) covariates
+subsets_nlc <- c(1:69)
+
+# Resampling options
+rfectrl <- rfeControl(functions = rfFuncs,
+				                   method = "cv",
+				                   verbose = FALSE,
+					                 allowParallel = TRUE,
+                           returnResamp = 'final')
+```
+
+
+3.1 Build global depth class model
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+# Register parallel processing
+cl <- makePSOCKcluster(30)
+registerDoParallel(cl)
+
+# Tune Model
+set.seed(4801)
+M1 = train(y=t.dc3$DepthClass, x=t.dc3[,-1], method="ranger", trControl = fitControl, num.trees=500, tuneGrid=rftunegrid, importance='impurity')
+stopCluster(cl)
+M1
+
+# Predict validation data
+M1.pred <- predict(M1, newdata = v.dc4)
+M1.cm <- confusionMatrix(data=M1.pred, reference = v.dc4$DepthClass)
+
+# Variable importance
+varImp(M1, scale = TRUE)
+
+# Partial Dependence plots (I will need to spend some time with these once I get a 'final' model)
+ #randomForest::partialPlot(M1$finalModel, t.dc2[,c(2,5:7,9:52,54)], "ppt_ratio", which.class='BR', rug=TRUE)
+ #randomForest::partialPlot(M1$finalModel, t.dc2[,c(2,5:51)], "ppt_ann", which.class='VD', rug=TRUE)
+
+```
+
+
+4.Variable Selection
+4.1 Variable Correlation
+There is nothing particularly surprising about the correlation plot. All of the relative elevations are highly correlated (as to be expected since it is the same calculation over a larger neighborhood). Elevation and precipitation are correlated, as are elevation, precipitation, and the landsat band ratios since they all are either influence, or are influened by vegetation. However; the correlation between annual temp and the variability of NDVI (4/3_std) is negative and a bit surprising. As annual temperaures get warmer the variability in NDVI goes down. Maybe this is because at cooler temperatures there vegetation becomes decidious. Otherwise, I don't see any particular reason to (un)select variables based on correlation. 
+
+After some thought, I decided to exclude the standard deviation of the Landsat band ratios: 5/7, 5/4, and 5/1. While the variability of 5/1 and 5/7 were important predictors I couldn't explain them. The median values are intended to capture spatial variations in minerology/geology, but are obviously influenced by vegetation. Since I am including variability in NDVI (4/3) I feel that this captures vegetation variability and I can explain this. 
+
+```{r, include=FALSE}
+# Investigate correlations between variables
+#library(corrplot)
+#corrplot(cor(t.dc2[,c(-c(2,4,6,7))]))
+```
+
+4.2 All relevant variables
+Testing to exclude variables as 'not-relevant' did not exclude any indicating that all the variables are relevant to the modeling efforts. All relevanat variables tested for using the Boruta Algorithm: Feature Selection with the Boruta Package - https://www.jstatsoft.org/article/view/v036i11/v36i11.pdf
+All variables confirmed important
+```{r, include=FALSE}
+# All relevant variables
+library(Boruta)
+set.seed(4801)
+arv <- Boruta(y=t.dc3$DepthClass, t.dc3[,-1])
+arv
+attStats(arv)[order(attStats(arv)$mean,decreasing=TRUE),]
+```
+
+
+4.3 Minimal-optimal variable set
+Recursive Feature Elimination. RFE "implements backwards selection of predictors based on predictor importance ranking. The predictors are ranked and the less important ones are sequentially eliminated prior to modeling. The goal is to find a subset of predictors that can be used to produce an accurate model" (rfe help page). This really does seem to be the optimal model. When I tried to reduce model complexity using a one SE rule in two ways (by eye and automatically) these resulted in decreased performance of ~ 2% accuracy and kappa when tested on the validation dataset. 
+
+Run model. This takes right around 2 hours on a 30 core machine. 
+```{r, include=FALSE}
+cl <- makePSOCKcluster(30)
+registerDoParallel(cl) 
+
+# Recursive Feature Elimination function
+print(Sys.time())
+set.seed(4801)
+M1.rfe <- rfe(y=t.dc3$DepthClass, x=t.dc3[,-1], sizes = subsets_lc, rfeControl = rfectrl)
+print(Sys.time())
+stopCluster(cl)
+M1.rfe
+
+# Predict validation data and generate confusion matrix
+M1.rfe.pred <- predict(M1.rfe, newdata = v.dc4)
+M1.rfe.cm <- confusionMatrix(data=M1.rfe.pred$pred, reference = v.dc4$DepthClass)
+
+# Which variables were selected? 
+predictors(M1.rfe) 
+```
+
+
+5. Rerun 'global' models not including the categorical land classifications. 
+Including categorical land classifications results in MLRA, EPA ecoregion 3 (US_L3Name), and Iwahashi Landforms being chosen as somewhat relevant covariates by recursive feature elimination. Why is this? Maybe clustering of observations? Does this suggest that I should model by subarea? 
+
+This results in an accuracy and kappa decrease of ~ 1%. 
+```{r, include=FALSE}
+# Set up parallization
+cl <- makePSOCKcluster(30)
+registerDoParallel(cl)
+
+# Model tuning:
+set.seed(4801)
+M2 = train(y=t.dc3$DepthClass, x=t.dc3[,-c(1,2,3,41)], method="ranger", trControl = fitControl, num.trees=500, tuneGrid=rftunegrid, importance='impurity')
+stopCluster(cl)
+M2
+
+# Predict independent validation dataset and print confusion matrix
+M2.pred <- predict(M2, newdata = v.dc4)
+M2.cm <- confusionMatrix(data=M2.pred, reference = v.dc4$DepthClass)
+```
+
+
+5.1 Minimal-optimal variable set without land classification variables
+Recursive Feature Elimination.
+```{r, echo=FALSE, include=FALSE}
+cl <- makePSOCKcluster(30)
+registerDoParallel(cl)
+
+# Model tuning:
+set.seed(4801)
+M2.rfe <- rfe(y=t.dc3$DepthClass, x=t.dc3[,-c(1,2,3,41)], sizes = subsets_nlc, rfeControl = rfectrl)
+stopCluster(cl)
+M2.rfe
+
+# Predict validation data and generate confusion matrix
+M2.rfe.pred <- predict(M2.rfe, newdata = v.dc4)
+M2.rfe.cm <- confusionMatrix(data=M2.rfe.pred$pred, reference = v.dc4$DepthClass)
+
+# Which variables were selected?  
+M2.rfe
+predictors(M2.rfe) 
+```
+
+
+6. What is the model like if I don't reserve a separate validation set, but instead include the validation observations as training data and rely on cross validation to assess model accuracy? For this model I am not including the land classification covariates. 
+```{r, echo=FALSE, include=FALSE}
+cl <- makePSOCKcluster(30)
+registerDoParallel(cl)
+
+# Model tuning:
+set.seed(4801)
+M3 = train(y=obs3$DepthClass, obs3[,-c(1:6,44)], method="ranger", trControl = fitControl, num.trees=500, tuneGrid=rftunegrid, importance='impurity')
+M3
+stopCluster(cl)
+```
+
+
+6.1 Minimal-optimal variable set without land classification variables
+Recursive Feature Elimination.
+```{r, echo=FALSE, include=FALSE}
+cl <- makePSOCKcluster(30)
+registerDoParallel(cl)
+
+# Train model
+set.seed(4801)
+M3.rfe <- rfe(y=obs3$DepthClass, obs3[,-c(1:6,44)], sizes = subsets_nlc, rfeControl = rfectrl)
+M3.rfe
+stopCluster(cl)
+
+# Which variables were selected?
+plot(M3.rfe)
+predictors(M3.rfe)
+```
+
+
+7. Compare model performance (it is convienent to put this all in one place)
+```{r}
+# Cross validation
+cvresults <- resamples(list(M1=M1, 
+                            M1.rfe=M1.rfe, 
+                            M2=M2, 
+                            M2.rfe=M2.rfe, 
+                            M3=M3, 
+                            M3.rfe=M3.rfe))
+bwplot(cvresults)
+
+# Are model cross validaiton metrics statistically different? 
+difvalues <- diff(cvresults)
+
+# Independent validation data
+mv <- data.frame(rbind(
+  M1.cm$overall[1:2],
+  M1.rfe.cm$overall[1:2],
+  M2.cm$overall[1:2],
+  M2.rfe.cm$overall[1:2]))
+rownames(mv) <- c('M1', 'M1.rfe', 'M2', 'M2.rfe')
+```
+The cross-validation plot suggests that model M3.rfe has the highest cross validation accuracy followed closely by model M1.rfe. M3.rfe uses all observations and no land classification variables, while M1.rfe uses only the training data and leaves in the landcover variables, which were chosen as important variables. The differences in model accuracy are not statistically different. 
+
+Interestingly, the independent validation values are greater than the cross validation values. The independent validation table reveals that model M1.rfe had an accuracy that was ~ 2% and kappa that was ~ 2% higher than the other models. A comparison of the cross-validation and independent validation values indicate that models M1.rfe and M3.rfe are likely to be the most accurate. Following this line of reasoning I've decided to use both model M1.rfe and model M3.rfe for predictions and compare the output.
+
+Also interesting is that recursive feature elimination generally increases model performance.
+
+Also interesting, is that by making the Iwahashi landforms integer (instead of numeric) the independent validation accuracy actually went up by ~ 1%.... hmmm. It is also no longer identifed as an important variable in M1.rfe. I think that this has to do with how randomForests deals with categorical variables. https://roamanalytics.com/2016/10/28/are-categorical-variables-getting-lost-in-your-random-forests/ 
+
+
+8. Predictions
+After trying to make predictions I found that I could not use the RFE models to actually make predictions (I am unsure why this happens, but it only predicts NA, weird). Rebuild models using the variables and tuning parameters selected by RFE. 
+
+```{r}
+# trainControl(method='none', means no resampling since I know the parameters already)
+cl <- makePSOCKcluster(30)
+registerDoParallel(cl)
+set.seed(4801)
+M1.rfe.2 <- train(y=t.dc3$DepthClass, 
+                  x=t.dc3[names(t.dc3) %in% predictors(M1.rfe)], 
+                  method="ranger", ntree=1000,
+                  trControl = trainControl(method = "none", 
+                                           classProbs = TRUE, 
+                                           savePredictions = T, 
+                                           allowParallel = TRUE), 
+                  tuneGrid=data.frame(mtry=M1.rfe$fit$mtry))
+
+
+M3.rfe.2 <- train(y=obs3$DepthClass, 
+                  x=obs3[names(obs3) %in% predictors(M3.rfe)], 
+                  method="ranger", ntree=1000,
+                  trControl = trainControl(method = "none", 
+                                           classProbs = TRUE, 
+                                           savePredictions = T, 
+                                           allowParallel = TRUE), 
+                  tuneGrid=data.frame(mtry=M3.rfe$fit$mtry))
+
+
+stopCluster(cl)
+```
+
+
+Write all models to file
+```{r}
+save.image("Z:/UCRB/Models/DepthClassModels 2.15.19.RData")
+```
+
+Set up covariates to make predictions. 
+```{r}
+library(raster)
+# List all .tif files (all possible covariates) 
+fil.tif <- list.files(path = "Z:/UCRB/Covariates", pattern = ".tif$", recursive = TRUE, full.names=TRUE)
+
+# Subset list of all covariates for only those that were selected by the model (the predictors() function gets the variable names from each model)
+M1covs <- grep(paste(predictors(M1.rfe.2), collapse="|"), fil.tif, value=TRUE)
+M1covs1 <- c(M1covs, "Z:/UCRB/Covariates/PelletierCovariates/upland_valley-bottom_and_lowland_sedimentary_deposit_thickness_m.tif") # Need to add manually because I used a name different than the file name
+
+
+M3covs <- grep(paste(predictors(M3.rfe.2), collapse="|"), fil.tif, value=TRUE)
+M3covs1 <- c(M3covs, "Z:/UCRB/Covariates/PelletierCovariates/upland_valley-bottom_and_lowland_sedimentary_deposit_thickness_m.tif") # Need to add manually because I used a name different than the file name
+
+# Create a raster stack for predictions
+M1.c4pred <- stack(M1covs1)
+M3.c4pred <-stack(M3covs1)
+
+# For reasons entirely unclear the above raster stack duplicates a number of covariates and names the original and duplicates with .1 & .2 extensions. Fix this. also rename the SDT layer to match what is in model.
+M1.c4pred1 <- dropLayer(M1.c4pred, grep("m.2", names(M1.c4pred)))
+names(M1.c4pred1) <- gsub(".1$", "", names(M1.c4pred1))
+names(M1.c4pred1) <- gsub("upland_valley.bottom_and_lowland_sedimentary_deposit_thickness_m$", "SDT", names(M1.c4pred1))
+
+
+M3.c4pred1 <- dropLayer(M3.c4pred, grep("m.2", names(M3.c4pred)))
+names(M3.c4pred1) <- gsub(".1$", "", names(M3.c4pred1))
+names(M3.c4pred1) <- gsub("upland_valley.bottom_and_lowland_sedimentary_deposit_thickness_m$", "SDT", names(M3.c4pred1))
+```
+
+Predict. (ClusterR or predict_rasterEngine would be much more elegant, but I got errors with both options. Something seems wrong with the hardware. This may not work on a VM with 2 nodes).
+Predictions take approximatly 25 hours to complete (to make both predictions). 
+
+Note: if the following code doesn't predict Nodata values, gets the data type wrong the following code will make it right:
+gdal_translate -co COMPRESS=LZW -ot Byte -a_nodata 0 -co NUM_THREADS=ALL_CPUS M3.rfe.2.DepthClass_Predictions_21519.tif M3.rfe.2.DepthClass_Predictions_21519_small.tif
+```{r}
+# library(raster)
+# rasterOptions(maxmemory = 2e+9, chunksize = 9e+7)
+# Sys.time()
+# beginCluster()
+# raster::predict(object=M1.c4pred1, model=M1.rfe.2, progress="text", filename = "Z:/UCRB/Predictions/M1.rfe.2.DepthClass_Predictions_21519.tif", datatype='INT1u', options=c("COMPRESS=LZW"))
+# raster::predict(object=M3.c4pred1, model=M3.rfe.2, progress="text", filename = "Z:/UCRB/Predictions/M3.rfe.2.DepthClass_Predictions_21519.tif", datatype='INT1u', options=c("COMPRESS=LZW"))
+# endCluster()
+# Sys.time()
+```
+
+AFter looking at the above predictions I will use the model built using all observations and recursive feature elimination (M3.rfe.2) to deliver the 'best' model to Kari and Mike. I will use M1.rfe as the 'global' model for the paper showing the importance of modeling by physiographic region. I will use M2.rfe to show that removing the land classification variables reduces model accuracy.  
+
+Use the model built using all observations and recursive feature elimination (M3.rfe.2) to predict class probabilities.
+This takes 13 hours
+```{r}
+# library(raster)
+# rasterOptions(maxmemory = 3e+9, chunksize = 9e+7)
+# Sys.time()
+# beginCluster()
+# raster::predict(object=M3.c4pred1, model=M3.rfe.2, index = 1:6, type = 'prob', progress="text", filename = "Z:/UCRB/Predictions/M3.rfe.2.DepthClass_Predictions_probs_21519.tif", datatype = 'FLT4S', options=c("COMPRESS=LZW"))
+# endCluster()
+# Sys.time()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+4.2 Compare validation metrics between the maximum and max-oneSE variable sets for the models with and without land classification covariates. Note all RF models use mtry = 2 as the optimal hyperparameter. 
+```{r, include = FALSE, echo=FALSE}
+# Models including land classification covariates
+# Best subset as id'd by RFE
+rfeBest <- t.dc3[, names(t.dc3) %in% c("DepthClass","ppt_ratio", "ppt_ann", "mlra", "temp_ann", "US_L3NAME", "L43_med", "L51_med", "L43_std", "ELEVm", "TIR_std", "L57_med", "RELMNHT128", "L51_std", "iwahashiLF", "RELHT128", "NLCDcl", "vv_med", "L54_std", "L54_med")]
+
+# Best rfe subset within one standard deviation
+rfeBestoSE <- t.dc3[, names(t.dc3) %in% c("DepthClass","ppt_ratio", "ppt_ann", "mlra", "temp_ann", "US_L3NAME",  "L43_med", "L51_med", "L43_std", "ELEVm")]
+
+# Models NOT including land classification covariates
+rfeBest.1 <- t.dc3[, names(t.dc3) %in% c("DepthClass","ppt_ratio" ,"temp_ann", "ppt_ann", "L51_med", "L43_med", "ELEVm",      "L43_std", "TIR_std", "L51_std", "L57_med", "NLCDcl", "RELMNHT128", "vv_med", "RELHT128", "L54_med", "L54_std", "L57_std", "TIR_med",  "vv_std", "PROTINDEX")]
+
+rfeBestoSE.1 <- t.dc3[, names(t.dc3) %in% c("DepthClass", "ppt_ratio", "temp_ann", "ppt_ann", "L51_med", "L43_med",   "ELEVm", "L43_std")]
+
+
+# Build Models
+cl <- makePSOCKcluster(30)
+registerDoParallel(cl)
+
+selCtrl <- trainControl(method = "cv", savePredictions = T, returnResamp = 'final', allowParallel = TRUE, selectionFunction='oneSE')
+
+# RFE with land classification covariates
+set.seed(4801)
+rfeBest.mod = train(y=rfeBest[,1], x=rfeBest[,-1], method="rf", trControl = selCtrl)
+
+# RFE one SE with land classification covariates
+set.seed(4801)
+rfeBestoSE.mod = train(y=rfeBestoSE[,1], x=rfeBestoSE[,-1], method="rf", trControl = selCtrl)
+
+# RFE without land classification covariates
+set.seed(4801)
+rfeBest.mod.1 = train(y=rfeBest.1[,1], x=rfeBest.1[,-1], method="rf", trControl = selCtrl)
+
+# RFE one SE without land classification covariates
+set.seed(4801)
+rfeBestoSE.mod.1 = train(y=rfeBestoSE.1[,1], x=rfeBestoSE.1[,-1], method="rf", trControl = selCtrl)
+
+stopCluster(cl)
+
+
+# Predict validation data
+#RFE Best with land classificaiton covariates
+rfeBest.mod.pred <- predict(rfeBest.mod, newdata = v.dc4)
+confusionMatrix(data=rfeBest.mod.pred, reference = v.dc4$DepthClass)
+
+#RFE Best oneSE with land classification covariates
+rfeBestoSE.mod.pred <- predict(rfeBestoSE.mod, newdata = v.dc4)
+confusionMatrix(data=rfeBestoSE.mod.pred, reference = v.dc4$DepthClass)
+
+#RFE Best without land classificaiton covariates
+rfeBest.mod.pred.1 <- predict(rfeBest.mod.1, newdata = v.dc4)
+confusionMatrix(data=rfeBest.mod.pred.1, reference = v.dc4$DepthClass)
+
+#RFE Best oneSE without land classification covariates
+rfeBestoSE.mod.pred.1 <- predict(rfeBestoSE.mod.1, newdata = v.dc4)
+confusionMatrix(data=rfeBestoSE.mod.pred.1, reference = v.dc4$DepthClass)
+
+```
+
+Validation results. Using all 20 covariates chosen by RFE without the land classification covariates results in the model with the highest accuracy and kappa (section C). The model with all 20 covariates chosen by RFE with the land classification covariates (section A) results in a model with similar, but slighly lower accuracy statistics. The main difference seems to be in the sensitivitiy of the deep class. Interestingly using all 20 covariates results in a model that is ~ 5% more accurate than models within one SE. This is likely because what I am calling the one standard error model is actually within one standard error of the model that is already within one standard error (because I set up the training to pick the model within one standard error of the model with the highest accuracy). In retrospect it doesn't seem to be a good idea to subset further from what recursive feature elimination chooses; at least for this data set. 
+
+
+
+A. RFE Best with land classificaiton covariates
+Confusion Matrix and Statistics
+
+          Reference
+Prediction  BR  VS   S  MD   D  VD
+        BR 119  16  13   8   3  48
+        VS   0  22  18  11   0   3
+        S    2  13  63  15   2  14
+        MD   2   2  15  61   8  24
+        D    0   0   1  14  50  15
+        VD  10  13  33  52  50 510
+
+Overall Statistics
+                                         
+               Accuracy : 0.6707         
+                 95% CI : (0.6437, 0.697)
+    No Information Rate : 0.4992         
+    P-Value [Acc > NIR] : < 2.2e-16      
+                                         
+                  Kappa : 0.5159         
+ Mcnemar's Test P-Value : NA             
+
+Statistics by Class:
+
+                     Class: BR Class: VS Class: S Class: MD Class: D Class: VD
+Sensitivity            0.89474   0.33333  0.44056   0.37888  0.44248    0.8306
+Specificity            0.91978   0.97251  0.95768   0.95229  0.97314    0.7435
+Pos Pred Value         0.57488   0.40741  0.57798   0.54464  0.62500    0.7635
+Neg Pred Value         0.98631   0.96259  0.92864   0.91055  0.94522    0.8149
+Prevalence             0.10813   0.05366  0.11626   0.13089  0.09187    0.4992
+Detection Rate         0.09675   0.01789  0.05122   0.04959  0.04065    0.4146
+Detection Prevalence   0.16829   0.04390  0.08862   0.09106  0.06504    0.5431
+Balanced Accuracy      0.90726   0.65292  0.69912   0.66559  0.70781    0.7871
+
+
+
+
+B. RFE Best oneSE with land classification covariates
+Confusion Matrix and Statistics
+
+          Reference
+Prediction  BR  VS   S  MD   D  VD
+        BR 118  11  15  10   4  51
+        VS   2  19  14  11   1   5
+        S    0  17  61  15   5  12
+        MD   4   4  20  59  14  38
+        D    0   1   0  12  52  15
+        VD   9  14  33  54  37 493
+
+Overall Statistics
+                                          
+               Accuracy : 0.652           
+                 95% CI : (0.6247, 0.6787)
+    No Information Rate : 0.4992          
+    P-Value [Acc > NIR] : < 2.2e-16       
+                                          
+                  Kappa : 0.4946          
+ Mcnemar's Test P-Value : 2.995e-13       
+
+Statistics by Class:
+
+                     Class: BR Class: VS Class: S Class: MD Class: D Class: VD
+Sensitivity            0.88722   0.28788  0.42657   0.36646  0.46018    0.8029
+Specificity            0.91705   0.97165  0.95492   0.92516  0.97493    0.7614
+Pos Pred Value         0.56459   0.36538  0.55455   0.42446  0.65000    0.7703
+Neg Pred Value         0.98531   0.96010  0.92679   0.90651  0.94696    0.7949
+Prevalence             0.10813   0.05366  0.11626   0.13089  0.09187    0.4992
+Detection Rate         0.09593   0.01545  0.04959   0.04797  0.04228    0.4008
+Detection Prevalence   0.16992   0.04228  0.08943   0.11301  0.06504    0.5203
+Balanced Accuracy      0.90213   0.62976  0.69075   0.64581  0.71755    0.7821
+
+
+
+
+
+C. RFE Best without land classification covariates
+Confusion Matrix and Statistics
+
+          Reference
+Prediction  BR  VS   S  MD   D  VD
+        BR 119  13  14   8   4  31
+        VS   1  21  16   8   1   2
+        S    1  13  64  17   0  12
+        MD   2   3  12  55   9  32
+        D    0   0   1  10  43  10
+        VD  10  16  36  63  56 527
+
+Overall Statistics
+                                         
+               Accuracy : 0.674          
+                 95% CI : (0.647, 0.7001)
+    No Information Rate : 0.4992         
+    P-Value [Acc > NIR] : < 2.2e-16      
+                                         
+                  Kappa : 0.5112         
+ Mcnemar's Test P-Value : < 2.2e-16      
+
+Statistics by Class:
+
+                     Class: BR Class: VS Class: S Class: MD Class: D Class: VD
+Sensitivity            0.89474   0.31818  0.44755   0.34161  0.38053    0.8583
+Specificity            0.93619   0.97595  0.96044   0.94574  0.98120    0.7062
+Pos Pred Value         0.62963   0.42857  0.59813   0.48673  0.67188    0.7444
+Neg Pred Value         0.98655   0.96190  0.92965   0.90510  0.93997    0.8333
+Prevalence             0.10813   0.05366  0.11626   0.13089  0.09187    0.4992
+Detection Rate         0.09675   0.01707  0.05203   0.04472  0.03496    0.4285
+Detection Prevalence   0.15366   0.03984  0.08699   0.09187  0.05203    0.5756
+Balanced Accuracy      0.91546   0.64706  0.70400   0.64368  0.68087    0.7822
+
+
+
+D. RFE Best oneSE without land classification covariates
+Confusion Matrix and Statistics
+
+          Reference
+Prediction  BR  VS   S  MD   D  VD
+        BR 115  12  17  10   7  51
+        VS   1  18  13  11   2   8
+        S    1  19  65  16   6  18
+        MD   3   5  16  61  12  45
+        D    0   0   0  11  51  16
+        VD  13  12  32  52  35 476
+
+Overall Statistics
+                                          
+               Accuracy : 0.639           
+                 95% CI : (0.6115, 0.6659)
+    No Information Rate : 0.4992          
+    P-Value [Acc > NIR] : < 2.2e-16       
+                                          
+                  Kappa : 0.4804          
+ Mcnemar's Test P-Value : 5.462e-11       
+
+Statistics by Class:
+
+                     Class: BR Class: VS Class: S Class: MD Class: D Class: VD
+Sensitivity             0.8647   0.27273  0.45455   0.37888  0.45133    0.7752
+Specificity             0.9116   0.96993  0.94480   0.92423  0.97583    0.7662
+Pos Pred Value          0.5425   0.33962  0.52000   0.42958  0.65385    0.7677
+Neg Pred Value          0.9823   0.95922  0.92941   0.90809  0.94618    0.7738
+Prevalence              0.1081   0.05366  0.11626   0.13089  0.09187    0.4992
+Detection Rate          0.0935   0.01463  0.05285   0.04959  0.04146    0.3870
+Detection Prevalence    0.1724   0.04309  0.10163   0.11545  0.06341    0.5041
+Balanced Accuracy       0.8881   0.62133  0.69967   0.65156  0.71358    0.7707
+
+
+
+First define a function that selects the model that is within one SE of the model that recursive feature elimnation identifies as 'best' (this is modifed from the oneSE function in the caret pacakge). Then assign this function to the selectSize slot in the rfFuncs (rfFuncs is an existing list is needed for randomForest recursive feature elimination). I tried this and it didn't result in an improved model. 
+```{r}
+# Create a new object so as to not write over the old rfFuncs object. 
+rfFuncs1 <- rfFuncs
+
+# Define the function (slightly modified from )
+onese.rfe <- function (x, metric, maximize) 
+{
+    index <- 1:nrow(x)
+    if (!maximize) {
+        bestIndex <- which.min(x[, metric])
+        perf <- x[bestIndex, metric] + (x[bestIndex, paste(metric, 
+            "SD", sep = "")])
+        candidates <- index[x[, metric] <= perf]
+        bestIter <- min(candidates)
+    }
+    else {
+        bestIndex <- which.max(x[, metric])
+        perf <- x[bestIndex, metric] - (x[bestIndex, paste(metric, 
+            "SD", sep = "")])
+        candidates <- index[x[, metric] >= perf]
+        bestIter <- min(candidates)
+    }
+    bestIter
+}
+
+# Assign the above function to the right slot in the rfFuncs1 object.
+rfFuncs1$selectSize <- onese.rfe
+```
+
+rfe for ranger from: https://github.com/topepo/caret/issues/555 
+```{r}
+rangerFuncs <-  list(summary = defaultSummary,
+                     fit = function(x, y, first, last, ...) {
+                       loadNamespace("ranger")
+                       dat <- if(is.data.frame(x)) 
+                         x else as.data.frame(x)
+                       dat$.outcome <- y
+                       ranger::ranger(.outcome ~ ., data = dat, 
+                                      importance = if(first) "impurity" else "none", 
+                                      probability = is.factor(y),
+                                      write.forest = TRUE,
+                                      ...)
+                     },
+                     pred = function(object, x)  {
+                       if(!is.data.frame(x)) x <- as.data.frame(x)
+                       out <- predict(object, x)$predictions
+                       if(object$treetype == "Probability estimation") {
+                         out <- cbind(pred = colnames(out)[apply(out, 1, which.max)],
+                                      out)
+                       } 
+                       out
+                     },
+                     rank = function(object, x, y) {
+                       if(length(object$variable.importance) == 0)
+                         stop("No importance values available")
+                       imps <- ranger:::importance(object)
+                       vimp <- data.frame(Overall = as.vector(imps),
+                                         var = names(imps))
+                       rownames(vimp) <- names(imps)
+                       
+                       vimp <- vimp[order(vimp$Overall, decreasing = TRUE),, drop = FALSE]
+                       vimp
+                     },
+                     selectSize = pickSizeBest,
+                     selectVar = pickVars)
+```
+
+
+
+
+  
+  
+ 
+
+#Making a test raster from a beef basin area to test predictions. 
+
+
+```{r}
+library(raster)
+traster <- raster("Z:/testextent.tif")
+testrast <- crop(M1.c4pred1, traster, filename = "Z:/testraster.tif", overwrite=T)
+names(testrast) <- names(M1.c4pred1)
+
+rasterOptions(maxmemory = 2e+9, chunksize = 9e+7)
+Sys.time()
+beginCluster()
+raster::predict(object=testrast, model=M1.rfe.2, index = 1:6, type = 'prob', progress="text", filename = "Z:/UCRB/Predictions/test4.tif", datatype = 'FLT4S')
+endCluster()
+Sys.time()
+```
+
+
+
+
+Here is how to write a .dbf that ARC will read as a RAT 
+https://gis.stackexchange.com/questions/257204/saving-geotiff-from-r 
+```{r}
+
+# testpred <- raster("Z:/UCRB/Predictions/M3.rfe.2.DepthClass_Predictions_21519.tif")
+# testpred <- ratify(testpred)
+# 
+# levels(testpred)[[1]]$NAME <- letters[1:nrow(levels(r)[[1]])]
+# # check results with levels(r)[[1]]
+# 
+# writeRaster(r, 'C:/DATA/r.tif')
+# 
+# 
+# 
+# library(tidyverse)
+# 
+# as.data.frame(table(as.vector(r)),
+#                        stringsAsFactors = FALSE) %>%
+#   rename(VALUE = Var1, COUNT = Freq) %>%
+#   # you can add some more cols here,
+#   # just keep nchar() < 254 and colnames < 8 chars:
+#   mutate(VALUE = as.integer(VALUE)) %>%
+#   foreign::write.dbf(., 'C:/DATA/r_2.tif.vat.dbf',
+#             factor2char = TRUE, max_nchar = 254)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+  

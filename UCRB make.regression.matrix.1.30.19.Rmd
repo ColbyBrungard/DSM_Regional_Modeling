@@ -1,0 +1,99 @@
+---
+title: "Create regression matrix for UCRB soil depth modeling"
+author: "cbrungard"
+date: "January 30, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(sp)
+library(raster)
+```
+
+
+1. Create regression matrix by intersecting observations with predictive variables
+```{r}
+
+# Convert points to spatial class
+obs <- read.csv("./Observations/pts3_1.30.09.csv")
+coordinates(obs) <- ~x+y
+# filtering removes the crs. Add back
+crs(obs) <- "+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0"
+
+# Project to match raster projections
+ptsaea <- spTransform(obs, "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs")
+
+
+
+# 1.1 From Travis' terrain and landcover variables. 
+library(raster)
+# This takes ~ 15 min. 
+# Create list of rasters
+tgrids <- list.files(path = "./Covariates/TravisCovariates", pattern=".tif$", full.names = TRUE)
+# Convert to raster
+tras <- lapply(tgrids, raster)
+# Extract
+t.ext <- lapply(tras, extract, ptsaea)
+# Convert list to dataframe
+ext2 <- data.frame(do.call(cbind, t.ext))
+# Get the variable names 
+tnam1 <- gsub("./UCRB_Covariates/","", tgrids)
+tnam2 <- gsub(".tif","", tnam1)
+tnam3 <- gsub('_rs', '', tnam2)
+
+# Rename
+names(ext2) <- tnam3
+
+#Relative mean height4 is -Inf for some reason. Remove this
+text3 <- ext2[,-29]
+
+###
+# 8.2 Julis' Landsat and Sentinal radar covariates from GoogleEarthEngine
+# Create list of rasters
+jgrids <- list.files(path = "./JuliusCovariates", pattern=".tif$", full.names = TRUE, recursive = TRUE)
+# Convert to raster
+jras <- lapply(jgrids, raster)
+# Extract
+extj <- lapply(jras, extract, ptsaea)
+# Convert list to dataframe
+extj2 <- data.frame(do.call(cbind, extj))
+
+# Get just the variable names 
+jnam1 <- gsub("./JuliusCovariates/Landsat","", jgrids)
+jnam2 <- gsub(".tif","", jnam1)
+jnam3 <- gsub("/L5_51/","", jnam2)
+jnam4 <- gsub("/L5_54/","", jnam3)
+jnam5 <- gsub("/L5_57/","", jnam4)
+jnam6 <- gsub("/L5_TIR/","", jnam5)
+jnam7 <- gsub("./JuliusCovariates/SentinalRadar/med/","", jnam6)
+jnam8 <- gsub("./JuliusCovariates/SentinalRadar/std/","", jnam7)
+jnam9 <- gsub("/L5_43/","", jnam8)
+
+# Rename
+names(extj2) <- jnam9
+
+
+
+
+
+
+
+
+
+
+
+
+#### 8.5 Join all covariates
+obs.df <- as.data.frame(obs)
+obs.rm1 <- cbind(obs.df, text3)
+obs.rm2 <- cbind(obs.rm1, extj2)
+obs.rm3 <- cbind(obs.rm2, mlrae[,1])
+names(obs.rm3)[54] <- 'mlra'
+obs.rm4 <- cbind(obs.rm3, eco4e[,c(2,4)]) 
+
+# 56 observations had NA in the predictors. This was because holes in the radar or imagery in areas of deep cliff or canyon and in lake areas of the Iwahashi landforms (because of course resolution), etc. I've got enough observations that it is easiest to just drop these for now. My other option would be to fill the 'holes' in the the raster using inverse distance weighting (rfillspgaps in the meteo package), but I tried this and maxed out 32 GB memory (could probably do this with 64 GB Ram). I'm just going to remove these observations. 
+library(tidyr)
+obs.rm5 <- drop_na(obs.rm4, 7:54) 
+
+# write.csv(obs.rm5, "./SDepth_regMatrix.csv", row.names=FALSE)

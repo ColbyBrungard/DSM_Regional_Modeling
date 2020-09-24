@@ -1,0 +1,188 @@
+---
+title: "Create regression matrix for UCRB soil depth modeling by intersecting observations with predictive variables"
+author: "cbrungard"
+date: "January 30, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = 'Z:/UCRB')
+library(sp)
+library(raster)
+library(snow)
+library(snowfall)
+
+memory.limit(500000) # Windows only
+rasterOptions(maxmemory = 1e+10, chunksize = 1e+09)
+```
+
+
+1. Convert points to spatial class
+```{r}
+obs <- read.csv("Z:/UCRB/Observations/pts2_1.8.20.csv")
+coordinates(obs) <- ~X+Y
+crs(obs) <- "+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0"
+# Project to match raster projections
+ptsaea <- spTransform(obs, "+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=0 +y_0=0 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs")
+```
+
+
+2. Land classification covariates
+```{r}
+# Create list of raster grids
+cov.grids <- list.files(path = "Z:/UCRB/Covariates/LandClassCovariates", pattern=".tif$", full.names = TRUE)
+#Parallelized extract: (larger datasets)
+rasterOptions(maxmemory = 1e+08)
+sfInit(parallel=TRUE, cpus=30)
+sfExport("ptsaea", "cov.grids")
+sfLibrary(raster)
+sfLibrary(rgdal)
+ov.lst <- sfLapply(cov.grids, function(i){try( raster::extract(raster(i), ptsaea) )})
+snowfall::sfStop()
+
+lg <- as.data.frame(ov.lst)
+names(lg) = tools::file_path_sans_ext(basename(cov.grids))
+lg$id <- seq.int(nrow(lg))
+
+# Some of the landclass values were NA because they fell along the study area border where the size of the cells (1km) resulted in NA. However; they are still valid points for training and testing because I know that their landclass covariates should belong to the nearest landclass raster (often these were only a few m from the pixel edge and it seems a shame to loose these as there were about 150)
+
+# Fill missing values by carrying the last value forward. 
+library(zoo)
+
+# fill NA using last observation carried forward. A quick visual check seems to indicate that this works very well except when the first observation is missing, then there is nothing to carry forward. Assign the first observation manually if it is missing. 
+lg$GeoStrat4 <- na.locf(lg$GeoStrat4)
+lg$GeoStrat8 <- na.locf(lg$GeoStrat8)
+
+lg$GeoStrat9[1]<- 0
+lg$GeoStrat9 <- na.locf(lg$GeoStrat9)
+
+lg$mlra_UCRB_m <- na.locf(lg$mlra_UCRB_m)    
+lg$us_eco_l3_m <- na.locf(lg$us_eco_l3_m)
+
+```
+
+
+3. Colby's terrain covariates
+```{r Colby}
+# Create list of raster grids
+cov.grids <- list.files(path = "Z:/UCRB/Covariates/ColbyCovariates", pattern=".tif$", full.names = TRUE)
+
+#Parallelized extract: (larger datasets)
+rasterOptions(maxmemory = 1e+08)
+sfInit(parallel=TRUE, cpus=30)
+sfExport("ptsaea", "cov.grids")
+sfLibrary(raster)
+sfLibrary(rgdal)
+ov.lst <- sfLapply(cov.grids, function(i){try( raster::extract(raster(i), ptsaea) )})
+snowfall::sfStop()
+
+cg <- as.data.frame(ov.lst)
+names(cg) = tools::file_path_sans_ext(basename(cov.grids))
+cg$id <- seq.int(nrow(cg))
+```
+
+
+4. Julis' Landsat and Sentinal radar covariates from GoogleEarthEngine
+```{r} 
+# Create list of rasters
+cov.grids <- list.files(path = "Z:/UCRB/Covariates/JuliusCovariates", pattern=".tif$", full.names = TRUE, recursive = TRUE)
+# Remove all those that were masked to the study area (_m) to avoid duplication. 
+cov.grids2 <- cov.grids[grep('_m.tif', cov.grids)]
+
+#Parallelized extract: (larger datasets)
+rasterOptions(maxmemory = 1e+08)
+sfInit(parallel=TRUE, cpus=30)
+sfExport("ptsaea", "cov.grids2")
+sfLibrary(raster)
+sfLibrary(rgdal)
+ov.lst <- sfLapply(cov.grids2, function(i){try( raster::extract(raster(i), ptsaea) )})
+snowfall::sfStop()
+
+jg <- as.data.frame(ov.lst)
+names(jg) = tools::file_path_sans_ext(basename(cov.grids2))
+jg$id <- seq.int(nrow(jg))
+```
+
+
+5. Pelletier's regolith thickness prediction
+```{r}
+prp <- raster("Z:/UCRB/Covariates/PelletierCovariates/upland_valley-bottom_and_lowland_sedimentary_deposit_thickness_m.tif")
+pg <- as.data.frame(raster::extract(prp, ptsaea))
+pg$id <- seq.int(nrow(pg))
+names(pg) <- c('SDT', 'id')
+```
+
+
+6. Tomi's depth predictions
+```{r} 
+# Create list of rasters
+cov.grids <- list.files(path = "Z:/UCRB/Covariates/TomiCovariates", pattern=".tif$", full.names = TRUE)
+
+#Parallelized extract: (larger datasets)
+rasterOptions(maxmemory = 1e+08)
+sfInit(parallel=TRUE, cpus=30)
+sfExport("ptsaea", "cov.grids")
+sfLibrary(raster)
+sfLibrary(rgdal)
+ov.lst <- sfLapply(cov.grids, function(i){try( raster::extract(raster(i), ptsaea) )})
+snowfall::sfStop()
+
+tg <- as.data.frame(ov.lst)
+names(tg) = tools::file_path_sans_ext(basename(cov.grids))
+tg$id <- seq.int(nrow(tg))
+```
+
+
+7. Travis' terrain Covariates
+```{r}
+# Create list of rasters
+cov.grids <- list.files(path = "Z:/UCRB/Covariates/TravisCovariates", pattern=".tif$", full.names = TRUE)
+
+#Parallelized extract: (larger datasets)
+rasterOptions(maxmemory = 1e+08)
+sfInit(parallel=TRUE, cpus=30)
+sfExport("ptsaea", "cov.grids")
+sfLibrary(raster)
+sfLibrary(rgdal)
+ov.lst <- sfLapply(cov.grids, function(i){try( raster::extract(raster(i), ptsaea) )})
+snowfall::sfStop()
+
+tng <- as.data.frame(ov.lst)
+names(tng) = tools::file_path_sans_ext(basename(cov.grids))
+tng$id <- seq.int(nrow(tng))
+```
+
+
+8. USGS Aeroradiometric covariates
+```{r}
+# Create list of rasters
+cov.grids <- list.files(path = "Z:/UCRB/Covariates/USGSCovariates", pattern=".tif$", full.names = TRUE)
+# Remove all those that were masked to the study area (_m) to avoid duplication. 
+cov.grids2 <- cov.grids[grep('_buff_m.tif', cov.grids)]
+
+#Parallelized extract: (larger datasets)
+rasterOptions(maxmemory = 1e+08)
+sfInit(parallel=TRUE, cpus=30)
+sfExport("ptsaea", "cov.grids2")
+sfLibrary(raster)
+sfLibrary(rgdal)
+ov.lst <- sfLapply(cov.grids2, function(i){try( raster::extract(raster(i), ptsaea) )})
+snowfall::sfStop()
+
+ug <- as.data.frame(ov.lst)
+names(ug) = tools::file_path_sans_ext(basename(cov.grids2))
+ug$id <- seq.int(nrow(ug))
+```
+
+
+9. Join all covariates, do a bit of data cleaning, and write to file.
+```{r} 
+library(tidyverse)
+all.covs <- list(lg, cg, jg, pg, tg, tng, ug) %>% reduce(left_join, by = 'id')
+regMat <- cbind(as.data.frame(ptsaea), all.covs)
+ 
+# RELMNHT4_rs_m was completly NA. Remove this. Also remove the id variable used to join dataframes 
+regMat1 <- subset(regMat, select=-c(RELMNHT4_rs_m, id))
+
+write.csv(regMat1, "Z:/UCRB/Observations/regMatrix_2.24.20.csv", row.names=FALSE)
+```

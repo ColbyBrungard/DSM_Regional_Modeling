@@ -9,7 +9,6 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 library(tidyr)
 library(caret)
-library(ranger)
 library(sp)
 library(doParallel)
 library(forcats)
@@ -41,7 +40,7 @@ obs2 <- subset(obs, select=-c(SiteID,Depth,GAP,NLCDcl_m,L51_std_m,L54_std_m,L57_
 obs3 <- drop_na(obs2)
 
 # Reorder the data frame to put all land class variables at the begining. This just makes indexing easier. 
-obs3 <- obs3[c(1:6,44,7:43,45:71)]
+obs3 <- obs3[c(1:6,43,7:42,44:70)]
 
 # Combine regions that only have a few observations (doing this here avoids trouble with accidently adding predictor columns, but I didn't figure this out until I tried modeling by region).
 # MLRA 
@@ -101,7 +100,8 @@ v.dc4 <- v.dc3[,-c(2:4)]
 
 2. Modeling
 Set up model tuning parameters that will be used repeatedly. 
-Note: I initially used ranger to speed up the model fitting, but abandoned this because I was unable to get class probability predictions from ranger models. I believe this to be because including the argument probability=TRUE makes it impossible for caret to calculate accuracy. Also, ranger didn't seem much faster than random forests.
+Note: I initially used ranger to speed up the model fitting, but abandoned this because I was unable to get class probability predictions from ranger models. I believe this to be because including the argument probability=TRUE makes it impossible for caret to calculate accuracy. Also, ranger didnt seem much faster than random forests.
+
 ```{r}
 # Set up resampling options: 10 fold cross validation
 fitControl <- trainControl(method = "cv", 
@@ -187,7 +187,7 @@ c.iwlf
 
 Save all models in case things crash
 ```{r}
-#save.image("Z:/UCRB/Models/byPhysiographicArea 3.5.18.Rdata")
+save.image("Z:/UCRB/Models/byPhysiographicArea 3.5.18.Rdata")
 ```
 
 
@@ -590,7 +590,8 @@ rownames(M1.varimp$importance) <- recode(rownames(M1.varimp$importance),
 "tpi_mosaic_m"= "Topographic position index",
 "tri_mosaic_m"= "Topographic ruggedness index",
 "twi_mosaic_m"= "Topographic wetness index",
-"tc_mosaic_m"= "Total curvature")
+"tc_mosaic_m"= "Total curvature", 
+"LFELEMS_m" = "Landform elements")
 
 
 for (i in seq(mlra.varimp)) {
@@ -657,7 +658,8 @@ rownames(mlra.varimp[[i]]) <- recode(rownames(mlra.varimp[[i]]),
 "tpi_mosaic_m"= "Topographic position index",
 "tri_mosaic_m"= "Topographic ruggedness index",
 "twi_mosaic_m"= "Topographic wetness index",
-"tc_mosaic_m"= "Total curvature")
+"tc_mosaic_m"= "Total curvature", 
+"LFELEMS_m" = "Landform elements")
 }
 
 for (i in seq(eco3.varimp)) {
@@ -724,7 +726,8 @@ rownames(eco3.varimp[[i]]) <- recode(rownames(eco3.varimp[[i]]),
 "tpi_mosaic_m"= "Topographic position index",
 "tri_mosaic_m"= "Topographic ruggedness index",
 "twi_mosaic_m"= "Topographic wetness index",
-"tc_mosaic_m"= "Total curvature")
+"tc_mosaic_m"= "Total curvature", 
+"LFELEMS_m" = "Landform elements")
 }
 
 for (i in seq(iwlf.varimp)) {
@@ -791,7 +794,8 @@ rownames(iwlf.varimp[[i]]) <- recode(rownames(iwlf.varimp[[i]]),
 "tpi_mosaic_m"= "Topographic position index",
 "tri_mosaic_m"= "Topographic ruggedness index",
 "twi_mosaic_m"= "Topographic wetness index",
-"tc_mosaic_m"= "Total curvature")
+"tc_mosaic_m"= "Total curvature", 
+"LFELEMS_m" = "Landform elements")
 }
 
 # Give better names for plotting. This works because I preserved the order of list elements. 
@@ -821,7 +825,6 @@ names(iwlf.varimp) <- c(
 'Hills',
 'Large highland slope',
 'Plateau, terrace, large lowland slope, plains')
-
 
 
 # Plot variable importance for each model
@@ -887,12 +890,6 @@ ggsave(paste0("Z:/UCRB/Figures/", 'varimp_','iwlf_', names(iwlf.varimp)[i], ".pn
 
 
 
-
-
-
-
-
-
 5. Predictions
 5.1 Set up covariates to make predictions. 
 ```{r}
@@ -936,9 +933,9 @@ Sys.time()
 ```
 
 
-5.4 Make predictions by area 
-5.4.1 MLRA
-```{r}
+#5.4 Make predictions by area 
+#5.4.1 MLRA
+#```{r}
 rasterOptions(maxmemory = 1e+9, chunksize = 1e+7, timer = TRUE)
 Sys.time()
 beginCluster()
@@ -956,21 +953,26 @@ beginCluster()
 endCluster()
 Sys.time()
 gc()
-```
+#```
 
 
-5.4.2 Ecoregion
+#5.4.2 Ecoregion
 ```{r}
 rasterOptions(maxmemory = 1e+9, chunksize = 1e+7, timer = TRUE)
 Sys.time()
 beginCluster()
 
-for (i in 1:length(c.eco3)) {
- raster::predict(object=Mpred1, model=c.eco3[i], progress="text", filename = paste0('Z:/UCRB/Predictions/phy_area/', 'eco3', names(c.eco3)[i], '.tif'), datatype = 'INT1U', options=c("COMPRESS=LZW"))
- }
+# for (i in 1:length(c.eco3)) {
+#  raster::predict(object=Mpred1, model=c.eco3[i], progress="text", filename = paste0('Z:/UCRB/Predictions/phy_area/', 'eco3', names(c.eco3)[i], '.tif'), datatype = 'INT1U', options=c("COMPRESS=LZW"))
+#  }
 
- for (i in 1:length(c.eco3)) {
- raster::predict(object=Mpred1, model=c.eco3[i], index = 1:6, type = 'prob', progress="text", filename = paste0('Z:/UCRB/Predictions/phy_area/', 'eco', names(c.iwlf)[i], '_prob','.tif'), datatype = 'FLT4S', options=c("COMPRESS=LZW"))
+ # for (i in 1:length(c.eco3)) {
+ # raster::predict(object=Mpred1, model=c.eco3[i], index = 1:6, type = 'prob', progress="text", filename = paste0('Z:/UCRB/Predictions/phy_area/', 'eco3', names(c.eco3)[i], '_prob','.tif'), datatype = 'FLT4S', options=c("COMPRESS=LZW"))
+ # }
+
+#Need to rerun for mistake in code, then uncomment above chunk and delete this chunk
+ for (i in 1:4) {
+ raster::predict(object=Mpred1, model=c.eco3[5:8][i], index = 1:6, type = 'prob', progress="text", filename = paste0('Z:/UCRB/Predictions/phy_area/', 'eco3', names(c.eco3)[i], '_prob','.tif'), datatype = 'FLT4S', options=c("COMPRESS=LZW"))
  }
 
 endCluster()
@@ -979,12 +981,8 @@ gc()
 ```
 
 
-
-
-probably a problem with _m
-
-5.4.3 Iwahashi Landform
-```{r}
+#5.4.3 Iwahashi Landform
+#```{r}
 rasterOptions(maxmemory = 1e+9, chunksize = 1e+7, timer = TRUE)
 Sys.time()
 beginCluster()
@@ -1000,11 +998,16 @@ for (i in 1:length(c.iwlf)) {
 endCluster()
 Sys.time()
 gc()
+#```
+
+Time to run = 
+(59025+61179+56601+59259+44684+46612+41673+43784+57100+54903+56536+57084+56608+42200+40377+41914+42004+41076+46439+43450+40921+45464+40996+40982+42082+42749+61042+56524+56743+57504+58391+50505+65186)/3600
+~ 460 hours or about 19 days. 32 GB RAM, using 31 processors. 
+
+
+```{r}
+run before
 ```
-
-
-
-
 
 
 
